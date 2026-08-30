@@ -1,0 +1,60 @@
+# ---------------------------------------------------------------
+# Environnement virtuel — jamais versionné : il est reconstruit par
+# pip install -r requirements.txt, et pèse plusieurs centaines de Mo.
+# ---------------------------------------------------------------
+.venv/
+venv/
+env/
+ENV/
+
+# ---------------------------------------------------------------
+# Fichiers compilés par Python
+# ---------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+
+# ---------------------------------------------------------------
+# Streamlit
+# Le thème (.streamlit/config.toml) DOIT être versionné : sans lui,
+# l'application s'affiche en clair au lieu du bleu nuit. En revanche
+# secrets.toml ne doit jamais quitter votre machine.
+# ---------------------------------------------------------------
+.streamlit/secrets.toml
+.streamlit/credentials.toml
+
+# ---------------------------------------------------------------
+# Éditeurs et outils
+# ---------------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ---------------------------------------------------------------
+# Système
+# ---------------------------------------------------------------
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+.DS_Store
+
+# ---------------------------------------------------------------
+# Données locales et exports
+# Les CSV téléchargés depuis l'application n'ont pas à être publiés.
+# ---------------------------------------------------------------
+*.log
+cto_never_far_away_*.csv
+data/
+exports/
+
+# ---------------------------------------------------------------
+# Variables d'environnement
+# ---------------------------------------------------------------
+.env
+.env.*

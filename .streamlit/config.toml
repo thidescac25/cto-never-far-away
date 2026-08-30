@@ -1,0 +1,15 @@
+# Thème repris de la présentation Mirion Technologies :
+# encre de nuit, ambre, et gris-bleu pour le texte secondaire.
+[theme]
+base = "dark"
+primaryColor = "#D8902A"
+backgroundColor = "#0E1B2B"
+secondaryBackgroundColor = "#17293F"
+textColor = "#E6EDF3"
+font = "sans serif"
+
+[server]
+headless = true
+
+[browser]
+gatherUsageStats = false
