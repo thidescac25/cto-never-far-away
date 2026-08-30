@@ -72,6 +72,24 @@ def carte_kpi(valeur: str, libelle: str, note: str = "", couleur: str = sc.BLANC
     )
 
 
+def note_source(profil: dict, *cles: str, sinon: str = "") -> str:
+    """
+    Mention « estimé » sous une carte dont la valeur a été reconstruite.
+
+    Une donnée publiée par Yahoo et un ratio recalculé à partir du bilan n'ont
+    pas la même valeur probante : les distinguer à l'écran évite de prendre
+    une estimation pour un chiffre officiel au moment d'arbitrer.
+    """
+    derives = profil.get("_derives") or set()
+    if any(cle in derives for cle in cles):
+        return "estimé — calcul interne"
+    # Aucune mention sous une carte vide : « publié par Yahoo » sous un tiret
+    # laisserait croire que Yahoo a répondu.
+    if not any(profil.get(cle) is not None for cle in cles):
+        return ""
+    return sinon
+
+
 def tableau_html(df: pd.DataFrame) -> str:
     entetes = "".join(f"<th class='num'>{c}</th>" if i > 0 else f"<th>{c}</th>" for i, c in enumerate(df.columns))
     lignes = []
@@ -194,6 +212,41 @@ def afficher_entete(ticker: str, meta: dict, info: dict, score: float) -> None:
     st.markdown(f'<div style="height:1px;background:{sc.FILET};margin:14px 0 18px 0;"></div>', unsafe_allow_html=True)
 
 
+def afficher_avertissement_source(profil: dict) -> None:
+    """
+    Signale, quand c'est le cas, que Yahoo refuse son endpoint authentifié à
+    l'hébergeur — et dit précisément ce qui en découle.
+
+    Ce bandeau n'est pas cosmétique : il sépare ce qui est publié de ce qui
+    est reconstruit, et nomme le seul bloc réellement perdu (le consensus des
+    analystes). Sans lui, des cartes vides passeraient pour un bug alors que
+    la cause est extérieure à l'application.
+    """
+    if not profil.get("_mode_degrade"):
+        return
+
+    with st.expander("Certaines données Yahoo sont indisponibles depuis cet hébergeur — détail", expanded=False):
+        st.markdown(
+            "**Ce qui se passe.** Les identités de société, ratios instantanés et avis d'analystes "
+            "transitent chez Yahoo par un point d'entrée (`quoteSummary`) qui exige un cookie et un "
+            "jeton d'authentification. Yahoo refuse de les délivrer aux adresses IP de centre de "
+            "données : l'appel aboutit depuis votre poste, pas depuis Streamlit Community Cloud. "
+            "Les cours et les états financiers, eux, passent par des points d'entrée non protégés "
+            "et restent parfaitement disponibles.\n\n"
+            "**Ce que fait l'application.** Cours, capitalisation, extrêmes 52 semaines et nombre "
+            "d'actions sont récupérés par une voie alternative ; PER, P/B, EV/EBITDA, bénéfice par "
+            "action, rendement et bêta sont recalculés à partir des comptes publiés et des cours. "
+            "Ces valeurs portent la mention « estimé — calcul interne » : elles sont cohérentes, "
+            "mais ne sont pas les chiffres publiés par Yahoo.\n\n"
+            "**Ce qui reste indisponible.** Le consensus des analystes — objectifs de cours, "
+            "prévisions de chiffre d'affaires et de bénéfices, répartition des avis — ainsi que la "
+            "description d'activité et les effectifs. Ces données n'existent nulle part ailleurs "
+            "dans le flux : rien ne permet de les reconstituer honnêtement, elles restent donc vides.\n\n"
+            "**Pour disposer de l'ensemble**, exécutez l'application en local "
+            "(`streamlit run app.py`) : depuis votre connexion, Yahoo répond normalement."
+        )
+
+
 # --------------------------------------------------------------------------- #
 # 3. Onglet Résumé
 # --------------------------------------------------------------------------- #
@@ -202,14 +255,19 @@ def onglet_resume(ticker: str, meta: dict, info: dict, historique: pd.DataFrame,
     devise = info.get("currency", meta.get("devise", ""))
 
     bande = "".join([
-        carte_kpi(fmt_grand_nombre(info.get("marketCap"), devise), "Capitalisation"),
-        carte_kpi(fmt_nombre(info.get("trailingPE")), "PER (trailing)"),
-        carte_kpi(fmt_pct((info.get("dividendYield") or 0)), "Rendement dividende"),
+        carte_kpi(fmt_grand_nombre(info.get("marketCap"), devise), "Capitalisation",
+                  note_source(info, "marketCap")),
+        carte_kpi(fmt_nombre(info.get("trailingPE")), "PER (trailing)",
+                  note_source(info, "trailingPE", "trailingEps")),
+        carte_kpi(fmt_pct(info.get("dividendYieldPct"), 2) if info.get("dividendYieldPct") else "—",
+                  "Rendement dividende",
+                  note_source(info, "dividendYieldPct", sinon="12 derniers mois")),
         carte_kpi(
             f"{fmt_prix(info.get('fiftyTwoWeekLow'), '')} – {fmt_prix(info.get('fiftyTwoWeekHigh'), devise)}",
-            "Range 52 semaines",
+            "Range 52 semaines", note_source(info, "fiftyTwoWeekHigh", "fiftyTwoWeekLow"),
         ),
-        carte_kpi(fmt_nombre(info.get("beta")), "Bêta"),
+        carte_kpi(fmt_nombre(info.get("beta")), "Bêta",
+                  note_source(info, "beta", sinon="publié par Yahoo")),
         carte_kpi(
             f"{(info.get('fullTimeEmployees') or 0):,}".replace(",", " ") if info.get("fullTimeEmployees") else "—",
             "Effectifs",
@@ -404,7 +462,9 @@ def _moyenne(serie: pd.Series, n: int) -> float | None:
 # --------------------------------------------------------------------------- #
 # 5. Onglet Résultats
 # --------------------------------------------------------------------------- #
-def onglet_resultats(ticker: str, info: dict, historique: pd.DataFrame, analystes: dict) -> None:
+def onglet_resultats(ticker: str, info: dict, historique: pd.DataFrame, analystes: dict,
+                     indicateurs: pd.DataFrame | None = None) -> None:
+    indicateurs = indicateurs if indicateurs is not None else pd.DataFrame()
     c1, c2, c3 = st.columns(3, gap="medium")
 
     with c1:
@@ -428,18 +488,51 @@ def onglet_resultats(ticker: str, info: dict, historique: pd.DataFrame, analyste
                     f'<span class="pastille pastille-baisse">Low : {fmt_pct(perf_bas)}</span></div>',
                     unsafe_allow_html=True,
                 )
+            elif not historique.empty:
+                # Repli : à défaut du consensus, on situe le cours dans son
+                # amplitude de l'année — une information factuelle, tirée des
+                # cours eux-mêmes, plutôt qu'une carte vide.
+                h = historique["Close"].dropna().tail(252)
+                fig = sc.fig_lignes_multi(list(h.index.strftime("%m/%y")), {"Cours": h},
+                                          [sc.BLANC], hauteur=260, suffixe="")
+                haut_52, bas_52 = info.get("fiftyTwoWeekHigh"), info.get("fiftyTwoWeekLow")
+                if haut_52:
+                    fig.add_hline(y=haut_52, line=dict(color=sc.HAUSSE, width=1.2, dash="dot"))
+                if bas_52:
+                    fig.add_hline(y=bas_52, line=dict(color=sc.BAISSE, width=1.2, dash="dot"))
+                st.plotly_chart(fig, config=CONFIG_PLOTLY, key=f"cibles_repli_{ticker}", width="stretch")
+                dernier = float(h.iloc[-1])
+                depuis_haut = (dernier / haut_52 - 1) * 100 if haut_52 else None
+                depuis_bas = (dernier / bas_52 - 1) * 100 if bas_52 else None
+                st.markdown(
+                    f'<div class="bandeau-carte">'
+                    f'<span class="pastille pastille-baisse">vs plus haut : {fmt_pct(depuis_haut)}</span>'
+                    f'<span class="pastille pastille-hausse">vs plus bas : {fmt_pct(depuis_bas)}</span></div>',
+                    unsafe_allow_html=True,
+                )
+                st.caption("Objectifs des analystes indisponibles : amplitude 52 semaines affichée à la place.")
             else:
                 st.caption("Objectifs de cours non disponibles pour cette valeur.")
 
     with c2:
         with st.container(border=True):
-            st.markdown('<div class="carte-titre">Prévisions du chiffre d\'affaires</div>', unsafe_allow_html=True)
-            _figure_prevision(analystes.get("prevision_ca"), ticker, "prevision_ca")
+            st.markdown('<div class="carte-titre">Chiffre d\'affaires — consensus ou historique</div>',
+                        unsafe_allow_html=True)
+            if not _figure_prevision(analystes.get("prevision_ca"), ticker, "prevision_ca"):
+                _figure_historique_repli(indicateurs, "revenu", ticker, "ca_repli",
+                                         sc.BLEU, "Consensus indisponible : trajectoire historique du CA.")
 
     with c3:
         with st.container(border=True):
-            st.markdown('<div class="carte-titre">Prévisions des EPS</div>', unsafe_allow_html=True)
-            _figure_prevision(analystes.get("prevision_eps"), ticker, "prevision_eps")
+            st.markdown('<div class="carte-titre">Bénéfice par action — consensus ou historique</div>',
+                        unsafe_allow_html=True)
+            if not _figure_prevision(analystes.get("prevision_eps"), ticker, "prevision_eps"):
+                eps_hist = pd.Series(dtype="float64")
+                if not indicateurs.empty and {"resultat_net", "actions_en_circulation"} <= set(indicateurs.columns):
+                    eps_hist = (indicateurs["resultat_net"] / indicateurs["actions_en_circulation"]).dropna()
+                _figure_serie_repli(eps_hist, indicateurs, ticker, "eps_repli", sc.AMBRE,
+                                    "Consensus indisponible : bénéfice par action reconstitué "
+                                    "(résultat net / actions en circulation).")
 
     c4, c5, c6 = st.columns(3, gap="medium")
 
@@ -504,23 +597,54 @@ def onglet_resultats(ticker: str, info: dict, historique: pd.DataFrame, analyste
                                       if info.get('currentPrice') and info.get('targetMeanPrice') else None, 30, " %"), unsafe_allow_html=True)
 
 
-def _figure_prevision(df: pd.DataFrame | None, ticker: str, cle: str) -> None:
+def _figure_prevision(df: pd.DataFrame | None, ticker: str, cle: str) -> bool:
+    """
+    Trace le consensus des analystes. Renvoie False si la donnée est absente,
+    afin que l'appelant puisse basculer sur un repli historique.
+    """
     if df is None or df.empty:
-        st.caption("Prévisions non disponibles pour cette valeur.")
-        return
-    colonne = next((c for c in ["avg", "average", "0y"] if c in df.columns), df.columns[0] if len(df.columns) else None)
+        return False
+    colonne = next((c for c in ["avg", "average", "0y"] if c in df.columns),
+                   df.columns[0] if len(df.columns) else None)
     if colonne is None:
-        st.caption("Prévisions non disponibles pour cette valeur.")
-        return
+        return False
     serie = pd.to_numeric(df[colonne], errors="coerce").dropna()
     if serie.empty:
-        st.caption("Prévisions non disponibles pour cette valeur.")
-        return
-    fig = sc.fig_lignes_multi(list(serie.index.astype(str)), {"Consensus": serie}, [sc.AMBRE], hauteur=260, suffixe="")
+        return False
+
+    fig = sc.fig_lignes_multi(list(serie.index.astype(str)), {"Consensus": serie},
+                              [sc.AMBRE], hauteur=260, suffixe="")
     st.plotly_chart(fig, config=CONFIG_PLOTLY, key=f"{cle}_{ticker}", width="stretch")
-    growth_col = next((c for c in ["growth"] if c in df.columns), None)
-    if growth_col:
-        st.caption(f"Croissance attendue (consensus) : {fmt_pct(pd.to_numeric(df[growth_col], errors='coerce').iloc[-1] * 100)}")
+    colonne_croissance = "growth" if "growth" in df.columns else None
+    if colonne_croissance:
+        valeur = pd.to_numeric(df[colonne_croissance], errors="coerce").dropna()
+        if not valeur.empty:
+            st.caption(f"Croissance attendue (consensus) : {fmt_pct(float(valeur.iloc[-1]) * 100)}")
+    return True
+
+
+def _figure_historique_repli(indicateurs: pd.DataFrame, colonne: str, ticker: str,
+                             cle: str, couleur: str, legende: str) -> None:
+    """Trajectoire historique d'une ligne comptable, en remplacement d'un consensus absent."""
+    if indicateurs is None or indicateurs.empty or colonne not in indicateurs:
+        st.caption("Donnée non disponible pour cette valeur.")
+        return
+    _figure_serie_repli(indicateurs[colonne].dropna(), indicateurs, ticker, cle, couleur, legende)
+
+
+def _figure_serie_repli(serie: pd.Series, indicateurs: pd.DataFrame, ticker: str,
+                        cle: str, couleur: str, legende: str) -> None:
+    """Barres historiques + bannière Perf/CAGR, pour une série déjà calculée."""
+    serie = serie.dropna() if serie is not None else pd.Series(dtype="float64")
+    if serie.empty:
+        st.caption("Donnée non disponible pour cette valeur.")
+        return
+    labels = [f"FY{pd.Timestamp(d).year % 100:02d}" for d in serie.index]
+    fig = sc.fig_barres(labels, serie, couleur=couleur, hauteur=250)
+    st.plotly_chart(fig, config=CONFIG_PLOTLY, key=f"{cle}_{ticker}", width="stretch")
+    st.markdown(sc.banniere_perf_cagr(md.performance_totale(serie), md.cagr(serie)),
+                unsafe_allow_html=True)
+    st.caption(legende)
 
 
 # --------------------------------------------------------------------------- #
@@ -649,18 +773,27 @@ def onglet_theses(ticker: str, detail_score: dict[str, float]) -> None:
 def onglet_valorisation(ticker: str, info: dict, indicateurs: pd.DataFrame, historique: pd.DataFrame) -> None:
     devise = info.get("currency", "")
     c1, c2, c3, c4, c5 = st.columns(5, gap="small")
-    for col, (val, lib) in zip(
+    for col, (val, lib, cles) in zip(
         [c1, c2, c3, c4, c5],
         [
-            (fmt_nombre(info.get("trailingPE")), "P/E (trailing)"),
-            (fmt_nombre(info.get("forwardPE")), "P/E (forward)"),
-            (fmt_nombre(info.get("priceToBook")), "P/B"),
-            (fmt_nombre(info.get("enterpriseToEbitda")), "EV/EBITDA"),
-            (fmt_nombre(info.get("pegRatio")), "PEG"),
+            (fmt_nombre(info.get("trailingPE")), "P/E (trailing)", ("trailingPE", "trailingEps")),
+            (fmt_nombre(info.get("forwardPE")), "P/E (forward)", ()),
+            (fmt_nombre(info.get("priceToBook")), "P/B", ("priceToBook",)),
+            (fmt_nombre(info.get("enterpriseToEbitda")), "EV/EBITDA", ("enterpriseToEbitda",)),
+            (fmt_nombre(info.get("pegRatio")), "PEG", ()),
         ],
     ):
         with col:
-            st.markdown(f'<div class="carte-baggr">{carte_kpi(val, lib)}</div>', unsafe_allow_html=True)
+            st.markdown(
+                f'<div class="carte-baggr">{carte_kpi(val, lib, note_source(info, *cles))}</div>',
+                unsafe_allow_html=True,
+            )
+    if "enterpriseToEbitda" in (info.get("_derives") or set()):
+        st.caption(
+            "EV/EBITDA estimé : l'EBITDA est approché par le résultat d'exploitation, "
+            "yfinance ne fournissant pas de ligne d'amortissements fiable. Le multiple "
+            "est donc un peu plus élevé qu'un EV/EBITDA publié."
+        )
 
     st.markdown("<div style='height:10px;'></div>", unsafe_allow_html=True)
     st.markdown('<div class="carte-titre" style="font-size:15px;">Calculateur de prix juste (indicatif)</div>', unsafe_allow_html=True)
@@ -717,39 +850,44 @@ def afficher_fiche(ticker: str, univers: dict[str, dict]) -> None:
 
     with st.spinner(f"Récupération des données fondamentales de {meta.get('nom', ticker)}…"):
         info = md.get_info(ticker)
+        rapide = md.get_fast_info(ticker)
         historique = md.get_historique(ticker)
+        dividendes = md.get_dividendes(ticker)
         etats = md.get_etats_financiers(ticker)
         analystes = md.get_donnees_analystes(ticker)
         repartition = md.get_repartition_activite(ticker)
         indicateurs = md.construire_indicateurs(etats, info)
-        score, detail_score = md.score_qualite(indicateurs, info)
+        indice = md.get_historique_indice() if not info.get("beta") else None
+        profil = md.construire_profil(info, rapide, indicateurs, historique, dividendes, meta, indice)
+        score, detail_score = md.score_qualite(indicateurs, profil)
 
-    if not info and historique.empty:
+    if not profil.get("currentPrice") and historique.empty and indicateurs.empty:
         st.error(
             f"Aucune donnée n'a pu être récupérée pour **{ticker}** ({meta.get('nom', '')}). "
             "Yahoo Finance est peut-être temporairement indisponible : réessayez dans quelques instants."
         )
         return
 
-    afficher_entete(ticker, meta, info, score)
+    afficher_entete(ticker, meta, profil, score)
+    afficher_avertissement_source(profil)
 
-    devise_etats = info.get("financialCurrency", info.get("currency", meta.get("devise", "")))
+    devise_etats = profil.get("financialCurrency", profil.get("currency", meta.get("devise", "")))
 
     onglets = st.tabs(["Résumé", "Quantitatif", "Résultats", "Finances", "Thèses", "Société", "Valorisation"])
     with onglets[0]:
-        onglet_resume(ticker, meta, info, historique, indicateurs, score, detail_score)
+        onglet_resume(ticker, meta, profil, historique, indicateurs, score, detail_score)
     with onglets[1]:
-        onglet_quantitatif(ticker, indicateurs, info)
+        onglet_quantitatif(ticker, indicateurs, profil)
     with onglets[2]:
-        onglet_resultats(ticker, info, historique, analystes)
+        onglet_resultats(ticker, profil, historique, analystes, indicateurs)
     with onglets[3]:
         onglet_finances(ticker, etats, indicateurs, repartition, devise_etats)
     with onglets[4]:
         onglet_theses(ticker, detail_score)
     with onglets[5]:
-        onglet_societe(ticker, meta, info)
+        onglet_societe(ticker, meta, profil)
     with onglets[6]:
-        onglet_valorisation(ticker, info, indicateurs, historique)
+        onglet_valorisation(ticker, profil, indicateurs, historique)
 
     st.markdown(
         f'<div style="font-size:11px;color:{sc.ARDOISE};margin-top:24px;line-height:1.7;">'

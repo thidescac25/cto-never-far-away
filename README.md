@@ -105,6 +105,42 @@ Pour chaque valeur, sept onglets :
   (croissance des bénéfices, horizon, multiple de sortie, taux d'actualisation pré-rempli
   avec le WACC estimé de la valeur).
 
+### Déploiement en ligne : ce que Yahoo refuse aux hébergeurs
+
+Yahoo Finance sert ses données par plusieurs points d'entrée, qui n'ont pas la même
+politique d'accès :
+
+| Point d'entrée | Contenu | Depuis un poste personnel | Depuis un hébergeur |
+|---|---|---|---|
+| `chart` | cours, dividendes, `fast_info` | ✅ | ✅ |
+| `fundamentals-timeseries` | comptes de résultat, bilans, flux | ✅ | ✅ |
+| `quoteSummary` | identité, ratios instantanés, avis d'analystes | ✅ | ❌ |
+
+`quoteSummary` exige un cookie et un jeton (« crumb ») délivrés par `fc.yahoo.com`.
+Yahoo refuse de les accorder aux adresses IP de centre de données : l'appel réussit
+en local et échoue sur Streamlit Community Cloud (ainsi que sur Heroku, Render ou
+toute VM cloud). Ce n'est pas un défaut de configuration et attendre n'y change rien.
+
+L'application le gère explicitement plutôt que d'afficher des cases vides :
+
+- **Récupéré par une autre voie** (`fast_info`, endpoint `chart`) : cours, clôture
+  précédente, capitalisation, extrêmes 52 semaines, nombre d'actions, devise.
+- **Recalculé** à partir des comptes publiés et des cours : bénéfice par action, PER,
+  P/B, valeur d'entreprise, EV/EBITDA, rendement du dividende (douze derniers mois
+  effectivement versés) et bêta (régression hebdomadaire face au S&P 500). Ces valeurs
+  portent à l'écran la mention **« estimé — calcul interne »** : un ratio reconstruit
+  et un chiffre publié n'ont pas la même valeur probante, les confondre serait la pire
+  des facilités sur un outil d'aide à la décision.
+- **Définitivement absent** : le consensus des analystes (objectifs de cours, prévisions
+  de chiffre d'affaires et de bénéfices, répartition des avis), la description d'activité
+  et les effectifs. Rien dans le flux disponible ne permet de les reconstituer
+  honnêtement. Les cartes concernées basculent alors sur un repli factuel — amplitude
+  52 semaines à la place des objectifs de cours, trajectoire historique à la place des
+  prévisions — clairement étiqueté comme tel.
+
+Un bandeau dépliable en tête de fiche explique la situation lorsqu'elle se produit.
+Pour disposer de l'ensemble des données, exécutez l'application en local.
+
 **Sur la fiabilité des données.** Yahoo Finance ne fournit pas tout, pour toutes les valeurs :
 la répartition géographique/sectorielle du chiffre d'affaires, en particulier, n'est publiée
 que pour une minorité de grandes capitalisations. Quand une donnée manque, la fiche affiche un

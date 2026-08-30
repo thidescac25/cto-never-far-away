@@ -15,6 +15,8 @@ cache utilise `st.cache_data`, ce qui garde la couche de calcul testable.
 
 from __future__ import annotations
 
+import time
+
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -38,13 +40,111 @@ PRIME_MARCHE_DEFAUT = 5.0  # prime de risque actions (%) par défaut
 # --------------------------------------------------------------------------- #
 @st.cache_data(ttl=TTL_INFO, show_spinner=False)
 def get_info(ticker: str) -> dict:
-    """Fiche d'identité et ratios instantanés (yf.Ticker.info)."""
+    """
+    Fiche d'identité et ratios instantanés (yf.Ticker.info).
+
+    ATTENTION — cet appel passe par l'endpoint `quoteSummary` de Yahoo, qui
+    exige un cookie et un jeton (« crumb ») obtenus auprès de fc.yahoo.com.
+    Yahoo refuse cette authentification depuis les adresses IP de centre de
+    données : l'appel réussit depuis une connexion résidentielle mais échoue
+    presque systématiquement depuis un hébergeur (Streamlit Community Cloud,
+    Heroku, Render, une VM cloud…). Le dictionnaire revient alors vide.
+
+    C'est une limite de Yahoo, pas un défaut de configuration : d'où la
+    couche de repli `get_fast_info` puis `construire_profil`, qui reconstruit
+    les mêmes grandeurs à partir des endpoints non protégés.
+
+    Deux tentatives sont faites, l'échec pouvant être un simple throttling.
+    """
+    for tentative in range(2):
+        try:
+            info = yf.Ticker(ticker).get_info()
+            if info and len(info) > 5:
+                return dict(info)
+        except Exception:
+            pass
+        if tentative == 0:
+            time.sleep(0.8)
+    return {}
+
+
+@st.cache_data(ttl=TTL_PRIX, show_spinner=False)
+def get_fast_info(ticker: str) -> dict:
+    """
+    Grandeurs de marché servies par l'endpoint `chart`, non protégé par crumb.
+
+    Contrairement à `get_info`, cet appel fonctionne aussi bien depuis un
+    hébergeur que depuis un poste personnel. Il ne fournit pas les données
+    fondamentales ni les avis d'analystes, mais couvre l'essentiel du bandeau
+    de tête : cours, clôture précédente, capitalisation, extrêmes 52 semaines,
+    nombre d'actions et devise.
+
+    Les clés renvoyées reprennent la nomenclature de `.info` (camelCase) pour
+    que les deux sources soient interchangeables en aval.
+    """
+    correspondances = {
+        "currency": "currency", "exchange": "exchange", "quote_type": "quoteType",
+        "shares": "sharesOutstanding", "market_cap": "marketCap",
+        "last_price": "currentPrice", "previous_close": "previousClose",
+        "open": "open", "day_high": "dayHigh", "day_low": "dayLow",
+        "year_high": "fiftyTwoWeekHigh", "year_low": "fiftyTwoWeekLow",
+        "year_change": "yearChange", "fifty_day_average": "fiftyDayAverage",
+        "two_hundred_day_average": "twoHundredDayAverage",
+    }
+    sortie: dict = {}
     try:
-        t = yf.Ticker(ticker)
-        info = t.get_info()
-        return dict(info) if info else {}
+        rapide = yf.Ticker(ticker).fast_info
     except Exception:
-        return {}
+        return sortie
+
+    for attribut, cle in correspondances.items():
+        try:
+            valeur = getattr(rapide, attribut, None)
+            if valeur is None:
+                continue
+            if isinstance(valeur, (int, float)) and not np.isfinite(float(valeur)):
+                continue
+            sortie[cle] = valeur
+        except Exception:
+            continue
+    return sortie
+
+
+@st.cache_data(ttl=TTL_PRIX, show_spinner=False)
+def get_dividendes(ticker: str) -> pd.Series:
+    """
+    Historique des dividendes versés par action (endpoint `chart`, non protégé).
+
+    Permet de recalculer un rendement courant même quand `.info` est
+    inaccessible.
+    """
+    try:
+        serie = yf.Ticker(ticker).dividends
+        if serie is None or len(serie) == 0:
+            return pd.Series(dtype="float64")
+        serie = serie.copy()
+        serie.index = pd.to_datetime(serie.index)
+        if getattr(serie.index, "tz", None) is not None:
+            serie.index = serie.index.tz_localize(None)
+        return serie.sort_index()
+    except Exception:
+        return pd.Series(dtype="float64")
+
+
+@st.cache_data(ttl=TTL_PRIX, show_spinner=False)
+def get_historique_indice(ticker_indice: str = "^GSPC", periode: str = "3y") -> pd.Series:
+    """Clôtures d'un indice de référence, pour estimer un bêta quand `.info` est muet."""
+    try:
+        hist = yf.Ticker(ticker_indice).history(period=periode, auto_adjust=True)
+        if hist is None or hist.empty or "Close" not in hist:
+            return pd.Series(dtype="float64")
+        serie = hist["Close"].dropna()
+        serie.index = pd.to_datetime(serie.index)
+        if getattr(serie.index, "tz", None) is not None:
+            serie.index = serie.index.tz_localize(None)
+        return serie
+    except Exception:
+        return pd.Series(dtype="float64")
 
 
 @st.cache_data(ttl=TTL_PRIX, show_spinner=False)
@@ -347,6 +447,190 @@ def construire_indicateurs(etats: dict[str, pd.DataFrame], info: dict) -> pd.Dat
 
     out.index = [pd.Timestamp(c) for c in out.index]
     return out.sort_index()
+
+
+# --------------------------------------------------------------------------- #
+# 3 bis. Profil consolidé — trois sources, de la plus fiable à la plus dérivée
+# --------------------------------------------------------------------------- #
+def _valide(valeur) -> bool:
+    """Vrai si la valeur est exploitable (ni None, ni NaN, ni infini)."""
+    if valeur is None:
+        return False
+    if isinstance(valeur, (int, float, np.floating, np.integer)):
+        return bool(np.isfinite(float(valeur)))
+    return True
+
+
+def _premier_valide(*valeurs):
+    for valeur in valeurs:
+        if _valide(valeur):
+            return valeur
+    return None
+
+
+def beta_estime(cours: pd.Series, indice: pd.Series, minimum_points: int = 60) -> float | None:
+    """
+    Bêta hebdomadaire d'une valeur face à un indice, sur la période commune.
+
+    Utilisé uniquement quand Yahoo ne fournit pas le bêta publié. Le pas
+    hebdomadaire limite le bruit des décalages d'horaires de clôture entre
+    places (Londres, Zurich, Paris contre New York), qui biaiserait un bêta
+    quotidien vers le bas.
+    """
+    if cours is None or indice is None or cours.empty or indice.empty:
+        return None
+    try:
+        rv = cours.resample("W-FRI").last().pct_change().dropna()
+        ri = indice.resample("W-FRI").last().pct_change().dropna()
+        commun = rv.index.intersection(ri.index)
+        if len(commun) < minimum_points:
+            return None
+        rv, ri = rv.loc[commun], ri.loc[commun]
+        variance = float(ri.var(ddof=1))
+        if variance <= 0:
+            return None
+        return float(np.cov(rv, ri, ddof=1)[0, 1] / variance)
+    except Exception:
+        return None
+
+
+def construire_profil(
+    info: dict,
+    rapide: dict,
+    indicateurs: pd.DataFrame,
+    historique: pd.DataFrame,
+    dividendes: pd.Series,
+    meta: dict,
+    indice: pd.Series | None = None,
+) -> dict:
+    """
+    Fusionne les sources disponibles en un profil unique, exploitable par la
+    fiche valeur, et note précisément d'où vient chaque grandeur.
+
+    Ordre de préférence, du plus fiable au plus reconstruit :
+        1. `.info` — chiffres publiés par Yahoo (indisponibles depuis un
+           hébergeur, voir la note de get_info) ;
+        2. `.fast_info` — grandeurs de marché de l'endpoint chart ;
+        3. dérivation — recalcul à partir des comptes annuels et des cours.
+
+    Les clés dérivées sont listées dans `profil["_derives"]`, ce qui permet à
+    l'affichage de les signaler comme des estimations : sur un outil d'aide à
+    la décision, faire passer un ratio recalculé pour un chiffre publié serait
+    la pire des commodités.
+
+    Le profil conserve la nomenclature de `.info` : les fonctions d'affichage
+    l'utilisent exactement comme elles utilisaient `.info` auparavant.
+    """
+    profil: dict = dict(info) if info else {}
+    derives: set[str] = set()
+
+    def poser(cle: str, valeur, derive: bool) -> None:
+        """Renseigne une clé absente et mémorise si la valeur est reconstruite."""
+        if _valide(profil.get(cle)) or not _valide(valeur):
+            return
+        profil[cle] = valeur
+        if derive:
+            derives.add(cle)
+
+    # ---- Cours et devise -------------------------------------------------- #
+    clotures = (
+        historique["Close"].dropna()
+        if isinstance(historique, pd.DataFrame) and not historique.empty and "Close" in historique
+        else pd.Series(dtype="float64")
+    )
+    dernier = float(clotures.iloc[-1]) if len(clotures) else None
+    avant_dernier = float(clotures.iloc[-2]) if len(clotures) > 1 else None
+
+    for cle in ("currency", "exchange", "quoteType", "marketCap", "sharesOutstanding",
+                "currentPrice", "previousClose", "fiftyTwoWeekHigh", "fiftyTwoWeekLow",
+                "fiftyDayAverage", "twoHundredDayAverage"):
+        poser(cle, rapide.get(cle), derive=False)  # fast_info : valeurs de marché, non dérivées
+
+    poser("currency", meta.get("devise"), derive=False)
+    poser("currentPrice", dernier, derive=True)
+    poser("previousClose", avant_dernier, derive=True)
+
+    if not _valide(profil.get("regularMarketChangePercent")):
+        prix, veille = profil.get("currentPrice"), profil.get("previousClose")
+        if _valide(prix) and _valide(veille) and veille:
+            poser("regularMarketChangePercent", (prix / veille - 1.0) * 100.0, derive=True)
+
+    # Extrêmes 52 semaines depuis l'historique, à défaut de fast_info
+    if len(clotures) > 20:
+        fenetre = clotures.tail(252)
+        hauts = historique["High"].dropna().tail(252) if "High" in historique else fenetre
+        bas = historique["Low"].dropna().tail(252) if "Low" in historique else fenetre
+        poser("fiftyTwoWeekHigh", float(hauts.max()), derive=True)
+        poser("fiftyTwoWeekLow", float(bas.min()), derive=True)
+
+    # ---- Grandeurs de bilan et de résultat -------------------------------- #
+    def dernier_valide(colonne: str) -> float | None:
+        if indicateurs is None or indicateurs.empty or colonne not in indicateurs:
+            return None
+        serie = indicateurs[colonne].dropna()
+        return float(serie.iloc[-1]) if not serie.empty else None
+
+    actions = _premier_valide(profil.get("sharesOutstanding"), dernier_valide("actions_en_circulation"))
+    if not _valide(profil.get("sharesOutstanding")) and _valide(actions):
+        poser("sharesOutstanding", actions, derive=True)
+
+    resultat_net = dernier_valide("resultat_net")
+    capitaux_propres = dernier_valide("capitaux_propres")
+    dette = dernier_valide("dette_totale")
+    tresorerie = dernier_valide("tresorerie")
+    exploitation = dernier_valide("resultat_exploitation")
+    prix = profil.get("currentPrice")
+
+    # Capitalisation = nombre d'actions x cours
+    if _valide(actions) and _valide(prix):
+        poser("marketCap", float(actions) * float(prix), derive=True)
+    capitalisation = profil.get("marketCap")
+
+    # Bénéfice par action, puis PER
+    if _valide(resultat_net) and _valide(actions) and actions:
+        poser("trailingEps", float(resultat_net) / float(actions), derive=True)
+    eps = profil.get("trailingEps")
+    if _valide(eps) and _valide(prix) and float(eps) > 0:
+        poser("trailingPE", float(prix) / float(eps), derive=True)
+
+    # Actif net par action, puis P/B
+    if _valide(capitalisation) and _valide(capitaux_propres) and capitaux_propres:
+        poser("priceToBook", float(capitalisation) / float(capitaux_propres), derive=True)
+
+    # Valeur d'entreprise et EV/EBITDA — l'EBITDA est approché par le résultat
+    # d'exploitation, faute de ligne d'amortissements fiable chez yfinance.
+    if _valide(capitalisation):
+        valeur_entreprise = float(capitalisation) + float(dette or 0.0) - float(tresorerie or 0.0)
+        poser("enterpriseValue", valeur_entreprise, derive=True)
+        if _valide(exploitation) and float(exploitation) > 0:
+            poser("enterpriseToEbitda", valeur_entreprise / float(exploitation), derive=True)
+
+    # Rendement du dividende, sur les douze derniers mois effectivement versés
+    if _valide(prix) and dividendes is not None and len(dividendes):
+        recents = dividendes[dividendes.index >= (dividendes.index[-1] - pd.Timedelta(days=365))]
+        verses = float(recents.sum())
+        if verses > 0:
+            poser("dividendYieldPct", verses / float(prix) * 100.0, derive=True)
+    if not _valide(profil.get("dividendYieldPct")) and _valide(info.get("dividendYield")):
+        # yfinance a livré ce champ tantôt en fraction, tantôt en pourcentage
+        # selon les versions : on normalise sur une base pourcentage.
+        brut = float(info["dividendYield"])
+        poser("dividendYieldPct", brut * 100.0 if brut < 1.0 else brut, derive=False)
+
+    # Bêta estimé face au S&P 500 quand Yahoo ne le publie pas
+    if not _valide(profil.get("beta")) and indice is not None and len(clotures) > 60:
+        estime = beta_estime(clotures, indice)
+        if _valide(estime):
+            poser("beta", estime, derive=True)
+
+    # ---- Identité, non reconstructible : repli sur l'univers du projet ----- #
+    poser("sector", meta.get("secteur"), derive=False)
+    poser("country", meta.get("pays"), derive=False)
+    poser("longName", meta.get("nom"), derive=False)
+
+    profil["_derives"] = derives
+    profil["_mode_degrade"] = not bool(info)
+    return profil
 
 
 # --------------------------------------------------------------------------- #

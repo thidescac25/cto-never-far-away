@@ -71,6 +71,29 @@ def appliquer_theme(fig: go.Figure, hauteur: int = 280, marge_haut: int = 24) ->
 # --------------------------------------------------------------------------- #
 # Graphiques en barres (revenu, bénéfices, FCF, actions en circulation, ...)
 # --------------------------------------------------------------------------- #
+def format_compact(valeur: float) -> str:
+    """
+    Étiquette courte pour un montant : 402,8 Md / 1,25 Md / 850 M / 12,4.
+
+    Les états financiers se chiffrent en milliards : sans cette compression,
+    les étiquettes de barres deviennent illisibles (« 402 800 000 000,0 ») et
+    se chevauchent.
+    """
+    if valeur is None or not np.isfinite(valeur):
+        return ""
+    signe = "-" if valeur < 0 else ""
+    v = abs(float(valeur))
+    if v >= 1e12:
+        return f"{signe}{v / 1e12:.2f} T".replace(".", ",")
+    if v >= 1e9:
+        return f"{signe}{v / 1e9:.1f} Md".replace(".", ",")
+    if v >= 1e6:
+        return f"{signe}{v / 1e6:.0f} M"
+    if v >= 1e4:
+        return f"{signe}{v:,.0f}".replace(",", " ")
+    return f"{signe}{v:,.2f}".replace(",", " ").replace(".", ",")
+
+
 def fig_barres(
     labels: list[str],
     valeurs: pd.Series,
@@ -84,17 +107,23 @@ def fig_barres(
     Barres verticales, avec un motif hachuré et une opacité réduite sur les
     `previsions` dernières colonnes — pour distinguer historique et
     consensus, comme sur les fiches Baggr.
+
+    Les étiquettes sont mises en forme compacte (Md, M) : les montants
+    comptables se comptent en milliards.
     """
     n = len(valeurs)
     opacites = [0.45 if i >= n - previsions else 0.92 for i in range(n)]
     motifs = ["/" if i >= n - previsions else "" for i in range(n)]
-    textes = [f"{prefixe}{v:,.1f}{suffixe}".replace(",", " ") if np.isfinite(v) else "" for v in valeurs]
+    textes = [
+        f"{prefixe}{format_compact(v)}{suffixe}" if np.isfinite(v) else ""
+        for v in valeurs
+    ]
 
     fig = go.Figure(go.Bar(
         x=labels, y=valeurs.values, marker=dict(color=couleur, opacity=opacites,
                                                 pattern=dict(shape=motifs, fgcolor=ENCRE, size=5)),
         text=textes, textposition="outside", textfont=dict(color=BRUME, size=10.5),
-        hovertemplate="%{x}<br>%{y:,.2f}<extra></extra>",
+        hovertemplate="%{x}<br>%{y:,.4s}<extra></extra>",
         cliponaxis=False,
     ))
     appliquer_theme(fig, hauteur=hauteur)
