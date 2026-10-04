@@ -247,6 +247,29 @@ def afficher_avertissement_source(profil: dict) -> None:
         )
 
 
+def texte_md(contenu: str) -> str:
+    """
+    Neutralise les caractères que Streamlit interpréterait comme du balisage.
+
+    Streamlit rend ses chaînes en Markdown, où « $ » ouvre une formule LaTeX :
+    sans échappement, « 81,7 Md$ ... 119,8 Md$ » fait passer tout le texte
+    intermédiaire en italique mathématique. Les montants en dollars étant
+    omniprésents dans les fiches, l'échappement se fait ici, à l'affichage,
+    plutôt que dans univers.py — ainsi les textes restent écrits naturellement
+    et une future retouche ne peut pas réintroduire le problème.
+    """
+    return (contenu or "").replace("$", r"\$")
+
+
+def _effectifs(info: dict, meta: dict) -> int | None:
+    """Effectif publié par Yahoo, à défaut celui de la fiche documentaire."""
+    valeur = info.get("fullTimeEmployees") or meta.get("effectifs")
+    try:
+        return int(valeur) if valeur else None
+    except (TypeError, ValueError):
+        return None
+
+
 # --------------------------------------------------------------------------- #
 # 3. Onglet Résumé
 # --------------------------------------------------------------------------- #
@@ -269,8 +292,10 @@ def onglet_resume(ticker: str, meta: dict, info: dict, historique: pd.DataFrame,
         carte_kpi(fmt_nombre(info.get("beta")), "Bêta",
                   note_source(info, "beta", sinon="publié par Yahoo")),
         carte_kpi(
-            f"{(info.get('fullTimeEmployees') or 0):,}".replace(",", " ") if info.get("fullTimeEmployees") else "—",
+            f"{_effectifs(info, meta):,}".replace(",", " ") if _effectifs(info, meta) else "—",
             "Effectifs",
+            f"au {meta['effectifs_au']}"
+            if not info.get("fullTimeEmployees") and meta.get("effectifs_au") else "",
         ),
     ])
     st.markdown(f'<div class="carte-baggr" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:4px;">{bande}</div>', unsafe_allow_html=True)
@@ -306,10 +331,10 @@ def onglet_resume(ticker: str, meta: dict, info: dict, historique: pd.DataFrame,
         if texte:
             st.markdown(f'<div class="carte-baggr">{texte}</div>', unsafe_allow_html=True)
 
-    resume = info.get("longBusinessSummary")
+    resume = meta.get("description") or info.get("longBusinessSummary")
     if resume:
         with st.expander("Présentation de l'activité"):
-            st.write(resume)
+            st.write(texte_md(resume))
 
 
 # --------------------------------------------------------------------------- #
@@ -701,23 +726,51 @@ def onglet_finances(ticker: str, etats: dict[str, pd.DataFrame], indicateurs: pd
 # 7. Onglet Société
 # --------------------------------------------------------------------------- #
 def onglet_societe(ticker: str, meta: dict, info: dict) -> None:
+    """
+    Identité de la société.
+
+    Secteur, industrie et effectifs viennent de Yahoo quand il répond, sinon de
+    la fiche documentaire tenue dans univers.py : ces trois champs font partie
+    du bloc que Yahoo refuse aux hébergeurs. La présentation affichée est en
+    revanche toujours celle d'univers.py — rédigée en français et centrée sur
+    le modèle économique, elle est plus utile que la notice générique de Yahoo,
+    qui reste consultable en repli juste en dessous.
+    """
+    effectifs = info.get("fullTimeEmployees") or meta.get("effectifs")
+    note_effectifs = (
+        f"au {meta['effectifs_au']}"
+        if not info.get("fullTimeEmployees") and meta.get("effectifs_au") else ""
+    )
+
     c1, c2, c3, c4 = st.columns(4, gap="medium")
-    for col, (valeur, libelle) in zip(
+    for col, (valeur, libelle, note) in zip(
         [c1, c2, c3, c4],
         [
-            (info.get("sector", meta.get("secteur", "—")), "Secteur"),
-            (info.get("industry", "—"), "Industrie"),
-            (info.get("country", meta.get("pays", "—")), "Pays"),
-            (f"{(info.get('fullTimeEmployees') or 0):,}".replace(",", " ") if info.get("fullTimeEmployees") else "—", "Effectifs"),
+            (info.get("sector") or meta.get("secteur", "—"), "Secteur", ""),
+            (info.get("industry") or meta.get("industrie", "—"), "Industrie", ""),
+            (info.get("country") or meta.get("pays", "—"), "Pays", ""),
+            (f"{effectifs:,}".replace(",", " ") if effectifs else "—", "Effectifs", note_effectifs),
         ],
     ):
         with col:
-            st.markdown(f'<div class="carte-baggr">{carte_kpi(str(valeur), libelle)}</div>', unsafe_allow_html=True)
+            st.markdown(
+                f'<div class="carte-baggr">{carte_kpi(str(valeur), libelle, note)}</div>',
+                unsafe_allow_html=True,
+            )
 
+    presentation = meta.get("description")
     with st.container(border=True):
         st.markdown('<div class="carte-titre">Présentation</div>', unsafe_allow_html=True)
-        resume = info.get("longBusinessSummary")
-        st.write(resume if resume else "Description non disponible pour cette valeur.")
+        if presentation:
+            st.write(texte_md(presentation))
+            if meta.get("arrete_au"):
+                st.caption(
+                    f"Rédigée à partir des dernières publications officielles de la société, "
+                    f"chiffres arrêtés au {meta['arrete_au']}. Ces chiffres ne se mettent pas "
+                    f"à jour automatiquement."
+                )
+        else:
+            st.write(texte_md(info.get("longBusinessSummary")) or "Description non disponible pour cette valeur.")
         infos_pratiques = []
         if info.get("website"):
             infos_pratiques.append(f"[Site officiel]({info['website']})")
@@ -726,11 +779,30 @@ def onglet_societe(ticker: str, meta: dict, info: dict) -> None:
         if infos_pratiques:
             st.caption(" · ".join(infos_pratiques))
 
+    notice = info.get("longBusinessSummary")
+    if notice and presentation:
+        with st.expander("Notice Yahoo Finance (en anglais)"):
+            st.write(texte_md(notice))
+
 
 # --------------------------------------------------------------------------- #
 # 8. Onglet Thèses
 # --------------------------------------------------------------------------- #
-def onglet_theses(ticker: str, detail_score: dict[str, float]) -> None:
+def onglet_theses(ticker: str, detail_score: dict[str, float], meta: dict | None = None) -> None:
+    meta = meta or {}
+
+    # L'avantage concurrentiel ne se déduit d'aucun ratio : il est rédigé à la
+    # main dans univers.py. Il précède la grille automatique, qui n'en mesure
+    # que les conséquences comptables.
+    if meta.get("moat"):
+        with st.container(border=True):
+            st.markdown(
+                f'<div class="carte-titre">Avantage concurrentiel {"—"} pourquoi ces revenus devraient durer</div>',
+                unsafe_allow_html=True,
+            )
+            st.write(texte_md(meta["moat"]))
+        st.markdown("<div style='height:8px;'></div>", unsafe_allow_html=True)
+
     if detail_score:
         tri = sorted(detail_score.items(), key=lambda kv: kv[1], reverse=True)
         col_forces, col_vigilance = st.columns(2, gap="medium")
@@ -883,7 +955,7 @@ def afficher_fiche(ticker: str, univers: dict[str, dict]) -> None:
     with onglets[3]:
         onglet_finances(ticker, etats, indicateurs, repartition, devise_etats)
     with onglets[4]:
-        onglet_theses(ticker, detail_score)
+        onglet_theses(ticker, detail_score, meta)
     with onglets[5]:
         onglet_societe(ticker, meta, profil)
     with onglets[6]:
